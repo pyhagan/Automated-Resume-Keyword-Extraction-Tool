@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for Automated Resume Keyword Extraction solution
+  using AWS managed VPC with API Gateway, Lambda, S3, DynamoDB, Textract,
+  Comprehend, CloudWatch, X-Ray, CloudTrail, and IAM.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name (dev)
+
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket for resume uploads
+
+  DynamoDBTableName:
+    Type: String
+    Description: Name of the DynamoDB table for storing extracted keywords
+
+  CloudTrailBucketName:
+    Type: String
+    Description: Name of the S3 bucket for CloudTrail logs
+
+Resources:
+
+  # S3 Bucket for resume uploads
+  ResumeUploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ResumeProcessorLambda.Arn
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-ResumeProcessorLambdaRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action:
+                  - textract:DetectDocumentText
+                  - textract:StartDocumentTextDetection
+                  - textract:GetDocumentTextDetection
+                  - comprehend:DetectKeyPhrases
+                  - comprehend:DetectEntities
+                  - comprehend:DetectKeyPhrases
+                  - comprehend:DetectEntities
+            
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTableName}
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+
+  # Lambda function to generate pre-signed URL
+  UrlGeneratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-UrlGenerator-${AWS::StackName}
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.client import Config
+
+          s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+
+          def handler(event, context):
+              bucket = os.environ['S3_BUCKET']
+              key = f"resumes/{context.aws_request_id}.pdf"
+
+              url = s3.generate_presigned_url(
+                  'put_object',
+                  Params={
+                      'Bucket': bucket,
+                      'Key': key,
+                      'ContentType': 'application/pdf'
+                  },
+                  ExpiresIn=3600
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'uploadUrl': url, 'key': key})
+              }
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+
+  # Lambda function to process resumes
+  ResumeProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-ResumeProcessor-${AWS::StackName}
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300 
+      MemorySize: 512
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+
+          s3 = boto3.client('s3')
+          textract = boto3.client('textract')
+          comprehend = boto3.client('comprehend')
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DDB_TABLE'])
+
+          def handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+
+                  # Start asynchronous text detection
+                  start_response = textract.start_document_text_detection(
+                      DocumentLocation={'S3Object': {'Bucket': bucket, 'Name': key}}
+                  )
+                  job_id = start_response['JobId']
+                  print(f"Started Textract job: {job_id}")
+
+                  # Poll until job completes
+                  status = None
+                  while status not in ["SUCCEEDED", "FAILED"]:
+                      time.sleep(10)  # wait between polls
+                      response = textract.get_document_text_detection(JobId=job_id)
+                      status = response['JobStatus']
+                      print(f"Job status: {status}")
+
+                  if status != "SUCCEEDED":
+                      print(f"Textract job {job_id} failed.")
+                      continue
+
+                  # Collect all pages
+                  text = ""
+                  next_token = None
+                  while True:
+                      if next_token:
+                          response = textract.get_document_text_detection(JobId=job_id, NextToken=next_token)
+                      else:
+                          response = textract.get_document_text_detection(JobId=job_id)
+
+                      for block in response['Blocks']:
+                          if block['BlockType'] == 'LINE':
+                              text += block['Text'] + " "
+
+                      next_token = response.get('NextToken')
+                      if not next_token:
+                          break
+
+                  print("Extracted text (first 500 chars):", text[:500])
+
+                  # Process with Comprehend in chunks (max 5000 chars/request)
+                  key_phrases = []
+                  for i in range(0, len(text), 4500):
+                      comp_response = comprehend.detect_key_phrases(
+                          Text=text[i:i+4500],
+                          LanguageCode='en'
+                      )
+                      key_phrases.extend([kp['Text'] for kp in comp_response['KeyPhrases']])
+
+                  # Store in DynamoDB
+                  table.put_item(
+                      Item={
+                          'ResumeKey': key,
+                          'JobId': job_id,
+                          'Keywords': key_phrases
+                      }
+                  )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Processing complete')
+              }
+      Environment:
+        Variables:
+          DDB_TABLE: !Ref DynamoDBTableName
+
+  # API Gateway Rest API
+  ResumeApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${EnvironmentName}-ResumeApi
+      Description: API Gateway for resume keyword extraction
+
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ResumeApi.RootResourceId
+      PathPart: upload
+      RestApiId: !Ref ResumeApi
+
+  UploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref UploadResource
+      RestApiId: !Ref ResumeApi
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UrlGeneratorLambda.Arn}/invocations
+
+  ResumeApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: UploadMethod
+    Properties:
+      RestApiId: !Ref ResumeApi
+      StageName: prod
+
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UrlGeneratorLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResumeApi}/*/POST/upload
+
+  ResumeKeywordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: ResumeKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ResumeKey
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResumeProcessorLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${S3BucketName}
+
+  # CloudTrail log bucket
+  CloudTrailLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CloudTrailBucketName
+      VersioningConfiguration:
+        Status: Enabled
+
+  # CloudTrail log bucket policy
+  CloudTrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${CloudTrailLogBucket}
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${CloudTrailLogBucket}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailLogBucketPolicy
+    Properties:
+      TrailName: !Sub ${EnvironmentName}-CloudTrail
+      IsLogging: true
+      S3BucketName: !Ref CloudTrailLogBucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-resume-ui-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:   
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:               
+        CorsRules:
+          - AllowedOrigins:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedHeaders:
+              - "*"
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${WebsiteBucket}/*
+
+Outputs:
+  ApiGatewayUrl:
+    Description: Base URL of the API Gateway
+    Value: !Sub https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+    Export:
+      Name: !Sub ${EnvironmentName}-ApiGatewayUrl
+
+  ApiUploadEndpoint:
+    Description: Full /upload endpoint
+    Value: !Sub https://${ResumeApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload
+    Export:
+      Name: !Sub ${EnvironmentName}-ApiUploadEndpoint
+
+  S3BucketName:
+    Description: Name of the S3 bucket for resume uploads
+    Value: !Ref S3BucketName
+    Export:
+      Name: !Sub ${EnvironmentName}-S3BucketName
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref DynamoDBTableName
+    Export:
+      Name: !Sub ${EnvironmentName}-DynamoDBTableName
+
+  UrlGeneratorLambdaArn:
+    Description: ARN of the URL Generator Lambda function
+    Value: !GetAtt UrlGeneratorLambda.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-UrlGeneratorLambdaArn
+
+  ResumeProcessorLambdaArn:
+    Description: ARN of the Resume Processor Lambda function
+    Value: !GetAtt ResumeProcessorLambda.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-ResumeProcessorLambdaArn
+
+  CloudTrailBucketName:
+    Description: Name of the S3 bucket storing CloudTrail logs
+    Value: !Ref CloudTrailLogBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-CloudTrailBucketName
+
+  WebsiteURL:
+    Description: Public URL for the hosted website
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+    Export:
+      Name: !Sub ${EnvironmentName}-WebsiteURL
